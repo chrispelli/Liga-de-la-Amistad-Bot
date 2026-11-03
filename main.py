@@ -77,7 +77,7 @@ def main():
                 partido["jornada"] = datos.group(1)
                 partido["fecha"] = datos.group(2)
 
-            marcador = re.search(r"\b(\d+)\s*-\s*(\d+)\b", contenido)
+        marcador = re.search(r"\b(\d+)\s+-\s+(\d+)\b", contenido)
             if marcador:
                 partido["marcador"] = (
                     f"{marcador.group(1)}-{marcador.group(2)}"
