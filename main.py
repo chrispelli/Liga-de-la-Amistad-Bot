@@ -6,14 +6,16 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
+
 
 BASE = "https://ligadelaamistadleon.es/"
-COMPETICION = urljoin(
-    BASE, "competicion/?competition_id=2&season_id=1"
-)
-SALIDA = Path("resultados")
-SALIDA.mkdir(exist_ok=True)
+COMPETICION = 2
+TEMPORADA = 1
+JORNADAS = 30
+
+CARPETA = Path("resultados")
+CARPETA.mkdir(exist_ok=True)
 
 SESION = requests.Session()
 SESION.headers.update({
@@ -21,118 +23,288 @@ SESION.headers.update({
 })
 
 
-def leer_pagina(url):
+def obtener_pagina(url):
+    """Descarga una página y devuelve su HTML."""
     respuesta = SESION.get(url, timeout=30)
     respuesta.raise_for_status()
-    respuesta.encoding = respuesta.apparent_encoding
     return BeautifulSoup(respuesta.text, "html.parser")
 
 
-def limpio(elemento):
-    return " ".join(elemento.stripped_strings)
+def texto(elemento):
+    """Extrae el texto de un elemento HTML."""
+    return elemento.get_text(" ", strip=True)
 
 
-def guardar(nombre, filas, columnas):
-    with (SALIDA / nombre).open(
-        "w", newline="", encoding="utf-8-sig"
-    ) as archivo:
-        escritor = csv.DictWriter(
-            archivo, fieldnames=columnas, extrasaction="ignore"
-        )
-        escritor.writeheader()
-        escritor.writerows(filas)
+def texto_acciones(celda):
+    """
+    Extrae las acciones de una celda.
+    También lee alt y title de imágenes por si los iconos
+    de goles o tarjetas están representados como imágenes.
+    """
+    partes = []
+
+    for nodo in celda.descendants:
+        if getattr(nodo, "name", None) == "img":
+            partes.append(nodo.get("alt", ""))
+            partes.append(nodo.get("title", ""))
+
+        elif isinstance(nodo, NavigableString):
+            partes.append(str(nodo))
+
+    return " ".join(parte for parte in partes if parte)
 
 
-def enlaces_partidos(pagina):
-    encontrados = set()
-
-    for a in pagina.find_all("a", href=True):
-        url = urljoin(BASE, a["href"])
-        ruta = urlparse(url)
-
-        if "/partido/" not in ruta.path:
-            continue
-
-        parametros = parse_qs(ruta.query)
-        if parametros.get("competicion", [""])[0] != "2":
-            continue
-
-        if parametros.get("match_id") or parametros.get("partido"):
-            encontrados.add(url)
-
-    return encontrados
-
-
-def texto_jugador(celda):
-    # Los nombres pueden estar en el atributo alt de una imagen.
-    imagenes = celda.find_all("img", alt=True)
-    for imagen in imagenes:
-        nombre = imagen.get("alt", "").strip()
-        if nombre:
-            return nombre
-
-    return limpio(celda)
+def normalizar_acciones(acciones):
+    """Elimina caracteres invisibles que pueden acompañar a los emojis."""
+    return (
+        acciones
+        .replace("\ufe0f", "")
+        .replace("\ufe0e", "")
+        .replace("\u200d", "")
+    )
 
 
 def contar_acciones(acciones, emoji):
-    coincidencias = re.findall(
-        re.escape(emoji) + r"\s*(\d*)", acciones
+    """
+    Cuenta las acciones indicadas por emoji.
+    Si aparece un número junto al emoji, utiliza ese número.
+    Si no aparece número, cuenta una acción.
+    """
+    acciones = normalizar_acciones(acciones)
+
+    patron = re.escape(emoji) + r"\s*(\d*)"
+    coincidencias = re.findall(patron, acciones)
+
+    return sum(int(numero) if numero else 1 for numero in coincidencias)
+
+
+def conseguir_id_partido(url):
+    """Obtiene el identificador del partido desde su URL."""
+    consulta = parse_qs(urlparse(url).query)
+
+    return (
+        consulta.get("match_id", [None])[0]
+        or consulta.get("partido", [None])[0]
     )
-    return sum(int(n) if n else 1 for n in coincidencias)
 
 
-def extraer_partido(url):
-    pagina = leer_pagina(url)
-    contenido = limpio(pagina)
-    parametros = parse_qs(urlparse(url).query)
-    id_partido = (
-        parametros.get("match_id", [""])[0]
-        or parametros.get("partido", [""])[0]
-    )
+def conseguir_enlaces_partidos(sopa):
+    """Busca los enlaces de partidos de la competición."""
+    enlaces = {}
 
-    jornada = ""
-    fecha = ""
-    competicion = re.search(
-        r"Segunda división\s+Jornada\s+(\d+)\s+"
-        r"(\d{2}/\d{2}/\d{4})",
-        contenido,
-        re.IGNORECASE
-    )
-    if competicion:
-        jornada, fecha = competicion.groups()
+    for enlace in sopa.find_all("a", href=True):
+        href = enlace["href"]
 
-    # No buscar marcadores en toda la página: primero se limita
-    # la búsqueda al encabezado, antes de la convocatoria.
-    encabezado = re.split(
-        r"CONVOCATORIA", contenido, maxsplit=1, flags=re.IGNORECASE
-    )[0]
+        if "match_id=" not in href and "partido=" not in href:
+            continue
 
-    goles_local = ""
-    goles_visitante = ""
-    marcador = ""
+        url = urljoin(BASE, href)
 
-    # La ficha del partido suele mostrar el resultado en su cabecera.
-    # Solo se acepta un resultado si hay un marcador antes de la
-    # sección de convocatoria.
-    resultado = re.search(
-        r"(?<!\d)(\d{1,2})\s*-\s*(\d{1,2})(?!\d)",
-        encabezado
-    )
-    if resultado:
-        goles_local, goles_visitante = resultado.groups()
-        marcador = f"{goles_local}-{goles_visitante}"
+        if "competition_id=2" not in url and "competicion=2" not in url:
+            continue
 
+        partido_id = conseguir_id_partido(url)
+
+        if partido_id:
+            enlaces[partido_id] = url
+
+    return enlaces
+
+
+def obtener_jornada():
+    """Recorre las jornadas y reúne los partidos encontrados."""
+    partidos = {}
+
+    for jornada in range(1, JORNADAS + 1):
+        url = (
+            f"{BASE}competicion/"
+            f"?competition_id={COMPETICION}"
+            f"&jornada={jornada}"
+            f"&season_id={TEMPORADA}"
+        )
+
+        print(f"Consultando jornada {jornada}...")
+
+        try:
+            sopa = obtener_pagina(url)
+            enlaces = conseguir_enlaces_partidos(sopa)
+
+            for partido_id, partido_url in enlaces.items():
+                partidos[partido_id] = {
+                    "jornada": jornada,
+                    "url": partido_url
+                }
+
+        except Exception as error:
+            print(f"Error en jornada {jornada}: {error}")
+
+        time.sleep(0.5)
+
+    return partidos
+
+
+def extraer_equipos(sopa):
+    """Intenta obtener los nombres de los dos equipos."""
     equipos = []
-    for imagen in pagina.find_all("img", alt=True):
+
+    for imagen in sopa.find_all("img", alt=True):
         nombre = imagen.get("alt", "").strip()
-        if nombre and nombre not in equipos:
+
+        if not nombre:
+            continue
+
+        nombre_limpio = nombre.lower()
+
+        if nombre_limpio in ("logo", "escudo", "imagen"):
+            continue
+
+        if nombre not in equipos:
             equipos.append(nombre)
 
-    local = equipos[0] if len(equipos) > 0 else ""
-    visitante = equipos[1] if len(equipos) > 1 else ""
+        if len(equipos) == 2:
+            break
+
+    return equipos[0] if len(equipos) > 0 else "", (
+        equipos[1] if len(equipos) > 1 else ""
+    )
+
+
+def extraer_marcador(sopa):
+    """
+    Busca el marcador antes de la sección de convocatoria.
+    Exige espacios alrededor del guion para evitar confundir
+    el resultado con fechas o temporadas como 2026-27.
+    """
+    contenido = texto(sopa)
+
+    antes_convocatoria = re.split(
+        r"CONVOCATORIA",
+        contenido,
+        maxsplit=1,
+        flags=re.IGNORECASE
+    )[0]
+
+    coincidencia = re.search(
+        r"\b(\d+)\s+[-–]\s+(\d+)\b",
+        antes_convocatoria
+    )
+
+    if coincidencia:
+        return int(coincidencia.group(1)), int(coincidencia.group(2))
+
+    return "", ""
+
+
+def extraer_fecha(sopa):
+    """Busca una fecha con formato día/mes/año."""
+    contenido = texto(sopa)
+
+    coincidencia = re.search(
+        r"\b(\d{2}/\d{2}/\d{4})\b",
+        contenido
+    )
+
+    return coincidencia.group(1) if coincidencia else ""
+
+
+def extraer_jugadores(sopa, partido_id, jornada, fecha, partido_url):
+    """Extrae goles y tarjetas de las tablas de jugadores."""
+    jugadores = []
+
+    equipo_actual = ""
+
+    for tabla in sopa.find_all("table"):
+
+        contenido_tabla = texto(tabla).upper()
+
+        if "JUGADOR" not in contenido_tabla:
+            continue
+
+        if "ACCIONES" not in contenido_tabla:
+            continue
+
+        # Intenta localizar el encabezado de la tabla.
+        encabezado = None
+
+        for fila in tabla.find_all("tr"):
+            celdas = fila.find_all(["th", "td"])
+            nombres_columnas = [texto(celda).upper() for celda in celdas]
+
+            if any("JUGADOR" in nombre for nombre in nombres_columnas):
+                encabezado = nombres_columnas
+                break
+
+        # El equipo suele aparecer en el encabezado anterior.
+        anterior = tabla.find_previous(["h1", "h2", "h3", "h4"])
+
+        if anterior:
+            equipo_actual = texto(anterior)
+
+        for fila in tabla.find_all("tr"):
+            celdas = fila.find_all(["td", "th"])
+
+            if len(celdas) < 3:
+                continue
+
+            valores = [texto(celda) for celda in celdas]
+
+            if any("JUGADOR" in valor.upper() for valor in valores):
+                continue
+
+            if any("ACCIONES" in valor.upper() for valor in valores):
+                continue
+
+            # En estas tablas el nombre suele estar en la tercera celda.
+            jugador = valores[2].strip()
+
+            if not jugador:
+                continue
+
+            # La última celda contiene las acciones.
+            acciones = texto_acciones(celdas[-1])
+
+            goles = contar_acciones(acciones, "⚽")
+            amarillas = contar_acciones(acciones, "🟨")
+            rojas = contar_acciones(acciones, "🟥")
+
+            jugadores.append({
+                "id_partido": partido_id,
+                "jornada": jornada,
+                "fecha": fecha,
+                "equipo": equipo_actual,
+                "jugador": jugador,
+                "goles": goles,
+                "amarillas": amarillas,
+                "rojas": rojas,
+                "acciones_originales": acciones,
+                "partido_url": partido_url
+            })
+
+    return jugadores
+
+
+def procesar_partido(partido_id, jornada, partido_url):
+    """Descarga y procesa un partido individual."""
+    print(f"Procesando partido {partido_id}...")
+
+    sopa = obtener_pagina(partido_url)
+
+    local, visitante = extraer_equipos(sopa)
+    goles_local, goles_visitante = extraer_marcador(sopa)
+    fecha = extraer_fecha(sopa)
+
+    marcador = ""
+
+    if goles_local != "" and goles_visitante != "":
+        marcador = f"{goles_local}-{goles_visitante}"
+
+    revisar = "NO"
+
+    if marcador == "" or local == "" or visitante == "":
+        revisar = "SI"
 
     partido = {
-        "id_partido": id_partido,
+        "id_partido": partido_id,
         "jornada": jornada,
         "fecha": fecha,
         "local": local,
@@ -140,136 +312,132 @@ def extraer_partido(url):
         "marcador": marcador,
         "goles_local": goles_local,
         "goles_visitante": goles_visitante,
-        "url": url,
-        "revisar": "SI" if not marcador else ""
+        "url": partido_url,
+        "revisar": revisar
     }
 
-    jugadores = []
-
-    for tabla in pagina.find_all("table"):
-        cabecera = limpio(tabla).upper()
-        if "JUGADOR" not in cabecera or "ACCIONES" not in cabecera:
-            continue
-
-        equipo = ""
-        titulo = tabla.find_previous(["h2", "h3", "h4"])
-        if titulo:
-            equipo = limpio(titulo)
-
-        for fila in tabla.find_all("tr"):
-            celdas = fila.find_all(["td", "th"])
-            if len(celdas) < 4:
-                continue
-
-            valores = [limpio(c) for c in celdas]
-            if "JUGADOR" in " ".join(valores).upper():
-                continue
-
-            nombre = texto_jugador(celdas[2])
-            acciones = limpio(celdas[-1])
-
-            if not nombre or nombre in ("—", "-"):
-                continue
-
-            jugadores.append({
-                "id_partido": id_partido,
-                "jornada": jornada,
-                "fecha": fecha,
-                "equipo": equipo,
-                "jugador": nombre,
-                "goles": contar_acciones(acciones, "⚽"),
-                "amarillas": contar_acciones(acciones, "🟨"),
-                "rojas": contar_acciones(acciones, "🟥"),
-                "acciones_originales": acciones,
-                "partido_url": url
-            })
+    jugadores = extraer_jugadores(
+        sopa,
+        partido_id,
+        jornada,
+        fecha,
+        partido_url
+    )
 
     return partido, jugadores
 
 
+def guardar_csv(nombre_archivo, columnas, filas):
+    """Guarda los datos en CSV compatible con Excel."""
+    ruta = CARPETA / nombre_archivo
+
+    with open(ruta, "w", newline="", encoding="utf-8-sig") as archivo:
+        escritor = csv.DictWriter(
+            archivo,
+            fieldnames=columnas,
+            extrasaction="ignore"
+        )
+
+        escritor.writeheader()
+        escritor.writerows(filas)
+
+    print(f"Archivo creado: {ruta}")
+
+
 def main():
-    partidos_por_id = {}
-    jugadores_por_clave = {}
+    print("===================================")
+    print(" BOT LIGA DE LA AMISTAD DE LEÓN")
+    print(" Segunda División")
+    print("===================================")
+
+    partidos_encontrados = obtener_jornada()
+
+    partidos_resultado = []
+    jugadores_resultado = []
     errores = []
 
-    print("Buscando partidos de Segunda División...")
-
-    # Consultar jornadas por separado permite encontrar partidos
-    # que no aparezcan enlazados en la portada.
-    for jornada in range(1, 31):
-        url_jornada = (
-            f"{BASE}competicion/"
-            f"?competition_id=2&jornada={jornada}&season_id=1"
-        )
+    for partido_id, datos in partidos_encontrados.items():
         try:
-            pagina = leer_pagina(url_jornada)
-            urls = enlaces_partidos(pagina)
-            print(f"Jornada {jornada}: {len(urls)} enlaces")
+            partido, jugadores = procesar_partido(
+                partido_id,
+                datos["jornada"],
+                datos["url"]
+            )
 
-            for url in urls:
-                clave = (
-                    parse_qs(urlparse(url).query)
-                    .get("match_id", [url])[0]
-                )
-                if clave in partidos_por_id:
-                    continue
-
-                try:
-                    partido, jugadores = extraer_partido(url)
-                    partidos_por_id[clave] = partido
-
-                    for jugador in jugadores:
-                        llave = (
-                            jugador["id_partido"],
-                            jugador["equipo"],
-                            jugador["jugador"]
-                        )
-                        jugadores_por_clave[llave] = jugador
-
-                    time.sleep(1)
-
-                except Exception as error:
-                    errores.append({
-                        "url": url,
-                        "error": str(error)
-                    })
-                    print(f"Error al leer partido: {url}: {error}")
+            partidos_resultado.append(partido)
+            jugadores_resultado.extend(jugadores)
 
         except Exception as error:
+            print(f"Error en partido {partido_id}: {error}")
+
             errores.append({
-                "url": url_jornada,
+                "id_partido": partido_id,
+                "url": datos["url"],
                 "error": str(error)
             })
-            print(f"Error en jornada {jornada}: {error}")
 
-    partidos = list(partidos_por_id.values())
-    jugadores = list(jugadores_por_clave.values())
+        time.sleep(0.5)
 
-    guardar(
-        "partidos.csv", partidos,
+    # Evita duplicar jugadores si una tabla aparece repetida.
+    jugadores_unicos = {}
+
+    for jugador in jugadores_resultado:
+        clave = (
+            jugador["id_partido"],
+            jugador["equipo"],
+            jugador["jugador"]
+        )
+
+        jugadores_unicos[clave] = jugador
+
+    jugadores_resultado = list(jugadores_unicos.values())
+
+    guardar_csv(
+        "partidos.csv",
         [
-            "id_partido", "jornada", "fecha", "local", "visitante",
-            "marcador", "goles_local", "goles_visitante", "url", "revisar"
-        ]
+            "id_partido",
+            "jornada",
+            "fecha",
+            "local",
+            "visitante",
+            "marcador",
+            "goles_local",
+            "goles_visitante",
+            "url",
+            "revisar"
+        ],
+        partidos_resultado
     )
-    guardar(
-        "jugadores.csv", jugadores,
+
+    guardar_csv(
+        "jugadores.csv",
         [
-            "id_partido", "jornada", "fecha", "equipo", "jugador",
-            "goles", "amarillas", "rojas", "acciones_originales",
+            "id_partido",
+            "jornada",
+            "fecha",
+            "equipo",
+            "jugador",
+            "goles",
+            "amarillas",
+            "rojas",
+            "acciones_originales",
             "partido_url"
-        ]
+        ],
+        jugadores_resultado
     )
-    guardar("errores.csv", errores, ["url", "error"])
 
-    pendientes = sum(1 for p in partidos if p["revisar"] == "SI")
+    guardar_csv(
+        "errores.csv",
+        ["id_partido", "url", "error"],
+        errores
+    )
 
-    print("\nProceso terminado.")
-    print(f"Partidos encontrados: {len(partidos)}")
-    print(f"Jugadores registrados: {len(jugadores)}")
-    print(f"Partidos pendientes de revisar: {pendientes}")
-    print(f"Errores de lectura: {len(errores)}")
-    print("Resultados guardados en la carpeta resultados/.")
+    print("-----------------------------------")
+    print(f"Partidos encontrados: {len(partidos_resultado)}")
+    print(f"Jugadores registrados: {len(jugadores_resultado)}")
+    print(f"Errores: {len(errores)}")
+    print("Proceso terminado.")
+    print("-----------------------------------")
 
 
 if __name__ == "__main__":
