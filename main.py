@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup
 
 
 BASE = "https://ligadelaamistadleon.es/"
@@ -23,89 +23,17 @@ SESION.headers.update({
 })
 
 
-def reparar_texto(valor):
-    """Intenta corregir caracteres UTF-8 interpretados incorrectamente."""
-    if not valor:
-        return ""
-
-    indicadores = ("Ã", "Â", "â€", "âš", "ðŸ")
-
-    if not any(indicador in valor for indicador in indicadores):
-        return valor
-
-    for codificacion in ("cp1252", "latin1"):
-        try:
-            reparado = valor.encode(codificacion).decode("utf-8")
-
-            errores_originales = sum(
-                valor.count(indicador) for indicador in indicadores
-            )
-            errores_reparados = sum(
-                reparado.count(indicador) for indicador in indicadores
-            )
-
-            if errores_reparados < errores_originales:
-                return reparado
-
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
-
-    return valor
-
-
 def obtener_pagina(url):
-    """Descarga la página y analiza su HTML."""
+    """Descarga el HTML y lo interpreta expresamente como UTF-8."""
     respuesta = SESION.get(url, timeout=30)
     respuesta.raise_for_status()
 
-    # Respeta la codificación declarada por la página cuando exista.
-    if not respuesta.encoding or respuesta.encoding.lower() == "iso-8859-1":
-        respuesta.encoding = respuesta.apparent_encoding or "utf-8"
-
-    return BeautifulSoup(respuesta.content, "html.parser")
+    html = respuesta.content.decode("utf-8", errors="replace")
+    return BeautifulSoup(html, "html.parser")
 
 
 def texto(elemento):
-    """Extrae texto y corrige posibles errores de codificación."""
-    contenido = elemento.get_text(" ", strip=True)
-    return reparar_texto(contenido)
-
-
-def texto_acciones(celda):
-    """Extrae texto, alt y title de los iconos de acciones."""
-    partes = []
-
-    for nodo in celda.descendants:
-        if getattr(nodo, "name", None) == "img":
-            partes.append(nodo.get("alt", ""))
-            partes.append(nodo.get("title", ""))
-
-        elif isinstance(nodo, NavigableString):
-            partes.append(str(nodo))
-
-    resultado = " ".join(parte for parte in partes if parte)
-    return reparar_texto(resultado)
-
-
-def normalizar_acciones(acciones):
-    acciones = reparar_texto(acciones)
-
-    return (
-        acciones
-        .replace("\ufe0f", "")
-        .replace("\ufe0e", "")
-        .replace("\u200d", "")
-    )
-
-
-def contar_acciones(acciones, emoji):
-    """Cuenta goles o tarjetas, respetando el número junto al icono."""
-    acciones = normalizar_acciones(acciones)
-
-    patron = re.escape(emoji) + r"\s*(\d*)"
-    coincidencias = re.findall(patron, acciones)
-
-    return sum(int(numero) if numero else 1 for numero in coincidencias)
+    return elemento.get_text(" ", strip=True)
 
 
 def conseguir_id_partido(url):
@@ -171,32 +99,34 @@ def obtener_jornada():
 
 
 def extraer_equipos(sopa):
-    """Busca los nombres de los equipos en los textos alt de imágenes."""
+    """Obtiene los equipos desde los encabezados del partido."""
+    equipos = []
+
+    for encabezado in sopa.find_all(["h2", "h3"]):
+        nombre = texto(encabezado).strip()
+
+        if nombre and nombre not in equipos:
+            equipos.append(nombre)
+
+    if len(equipos) >= 2:
+        return equipos[0], equipos[1]
+
+    # Alternativa: nombres de los escudos.
     equipos = []
 
     for imagen in sopa.find_all("img", alt=True):
-        nombre = reparar_texto(imagen.get("alt", "").strip())
+        nombre = imagen.get("alt", "").strip()
 
-        if not nombre:
-            continue
-
-        nombre_limpio = nombre.lower()
-
-        if any(palabra in nombre_limpio for palabra in (
-            "logo", "escudo", "imagen", "liga de la amistad"
-        )):
-            continue
-
-        if nombre not in equipos:
+        if nombre and nombre not in equipos:
             equipos.append(nombre)
 
         if len(equipos) == 2:
             break
 
-    local = equipos[0] if len(equipos) > 0 else ""
-    visitante = equipos[1] if len(equipos) > 1 else ""
-
-    return local, visitante
+    return (
+        equipos[0] if equipos else "",
+        equipos[1] if len(equipos) > 1 else ""
+    )
 
 
 def extraer_marcador(sopa):
@@ -231,41 +161,89 @@ def extraer_fecha(sopa):
     return coincidencia.group(1) if coincidencia else ""
 
 
+def obtener_nombre_jugador(celda):
+    """
+    Prioriza el atributo alt de la imagen del jugador,
+    que contiene el nombre completo publicado por la liga.
+    """
+    imagen = celda.find("img", alt=True)
+
+    if imagen:
+        nombre = imagen.get("alt", "").strip()
+        if nombre:
+            return nombre
+
+    return texto(celda).strip()
+
+
+def extraer_acciones(celda):
+    """Lee las acciones publicadas en la última celda."""
+    return texto(celda)
+
+
+def contar_acciones(acciones, emoji):
+    """Cuenta los iconos y sus cantidades."""
+    acciones = (
+        acciones
+        .replace("\ufe0f", "")
+        .replace("\ufe0e", "")
+        .replace("\u200d", "")
+    )
+
+    patron = re.escape(emoji) + r"\s*(\d*)"
+    coincidencias = re.findall(patron, acciones)
+
+    return sum(int(numero) if numero else 1 for numero in coincidencias)
+
+
+def descripcion_acciones(goles, amarillas, rojas):
+    """Devuelve acciones en texto normal, sin emojis."""
+    partes = []
+
+    if goles:
+        partes.append(f"Goles: {goles}")
+
+    if amarillas:
+        partes.append(f"Amarillas: {amarillas}")
+
+    if rojas:
+        partes.append(f"Rojas: {rojas}")
+
+    return "; ".join(partes) if partes else "Sin acciones"
+
+
 def extraer_jugadores(sopa, partido_id, jornada, fecha, partido_url):
     jugadores = []
 
     for tabla in sopa.find_all("table"):
-        contenido_tabla = texto(tabla).upper()
+        cabecera = texto(tabla).upper()
 
-        if "JUGADOR" not in contenido_tabla:
+        if "JUGADOR" not in cabecera or "ACCIONES" not in cabecera:
             continue
 
-        if "ACCIONES" not in contenido_tabla:
-            continue
-
-        anterior = tabla.find_previous(["h1", "h2", "h3", "h4"])
-        equipo_actual = texto(anterior) if anterior else ""
+        encabezado = tabla.find_previous(["h2", "h3", "h4"])
+        equipo_actual = texto(encabezado) if encabezado else ""
 
         for fila in tabla.find_all("tr"):
             celdas = fila.find_all(["td", "th"])
 
-            if len(celdas) < 3:
+            if len(celdas) < 4:
                 continue
 
-            valores = [texto(celda) for celda in celdas]
+            valores = [texto(celda).upper() for celda in celdas]
 
-            if any("JUGADOR" in valor.upper() for valor in valores):
+            if any("JUGADOR" in valor for valor in valores):
                 continue
 
-            if any("ACCIONES" in valor.upper() for valor in valores):
+            if any("ACCIONES" in valor for valor in valores):
                 continue
 
-            jugador = valores[2].strip()
+            jugador = obtener_nombre_jugador(celdas[2])
 
-            if not jugador:
+            if not jugador or jugador == "—":
                 continue
 
-            acciones = texto_acciones(celdas[-1])
+            acciones = extraer_acciones(celdas[-1])
 
             goles = contar_acciones(acciones, "⚽")
             amarillas = contar_acciones(acciones, "🟨")
@@ -280,7 +258,9 @@ def extraer_jugadores(sopa, partido_id, jornada, fecha, partido_url):
                 "goles": goles,
                 "amarillas": amarillas,
                 "rojas": rojas,
-                "acciones_originales": acciones,
+                "acciones_originales": descripcion_acciones(
+                    goles, amarillas, rojas
+                ),
                 "partido_url": partido_url
             })
 
