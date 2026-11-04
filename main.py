@@ -23,38 +23,52 @@ SESION.headers.update({
 })
 
 
-def obtener_pagina(url):
-    """Descarga la página e intenta leerla correctamente en UTF-8."""
-    respuesta = SESION.get(url, timeout=30)
-    respuesta.raise_for_status()
-    respuesta.encoding = "utf-8"
-
-    return BeautifulSoup(respuesta.text, "html.parser")
-
-
-def texto(elemento):
-    return elemento.get_text(" ", strip=True)
-
-
 def reparar_texto(valor):
-    """
-    Repara texto UTF-8 que haya sido interpretado por error
-    como Windows-1252 o Latin-1.
-    """
+    """Intenta corregir caracteres UTF-8 interpretados incorrectamente."""
     if not valor:
         return ""
+
+    indicadores = ("Ã", "Â", "â€", "âš", "ðŸ")
+
+    if not any(indicador in valor for indicador in indicadores):
+        return valor
 
     for codificacion in ("cp1252", "latin1"):
         try:
             reparado = valor.encode(codificacion).decode("utf-8")
 
-            if any(simbolo in reparado for simbolo in ("⚽", "🟨", "🟥")):
+            errores_originales = sum(
+                valor.count(indicador) for indicador in indicadores
+            )
+            errores_reparados = sum(
+                reparado.count(indicador) for indicador in indicadores
+            )
+
+            if errores_reparados < errores_originales:
                 return reparado
 
         except (UnicodeEncodeError, UnicodeDecodeError):
             pass
 
     return valor
+
+
+def obtener_pagina(url):
+    """Descarga la página y analiza su HTML."""
+    respuesta = SESION.get(url, timeout=30)
+    respuesta.raise_for_status()
+
+    # Respeta la codificación declarada por la página cuando exista.
+    if not respuesta.encoding or respuesta.encoding.lower() == "iso-8859-1":
+        respuesta.encoding = respuesta.apparent_encoding or "utf-8"
+
+    return BeautifulSoup(respuesta.content, "html.parser")
+
+
+def texto(elemento):
+    """Extrae texto y corrige posibles errores de codificación."""
+    contenido = elemento.get_text(" ", strip=True)
+    return reparar_texto(contenido)
 
 
 def texto_acciones(celda):
@@ -85,7 +99,7 @@ def normalizar_acciones(acciones):
 
 
 def contar_acciones(acciones, emoji):
-    """Cuenta las acciones y respeta el número que aparece junto al icono."""
+    """Cuenta goles o tarjetas, respetando el número junto al icono."""
     acciones = normalizar_acciones(acciones)
 
     patron = re.escape(emoji) + r"\s*(\d*)"
@@ -157,15 +171,11 @@ def obtener_jornada():
 
 
 def extraer_equipos(sopa):
-    """
-    Busca los nombres de los equipos en los textos alternativos
-    de las imágenes. Es una extracción provisional: hay que
-    comprobar que la web no incluya primero otros logotipos.
-    """
+    """Busca los nombres de los equipos en los textos alt de imágenes."""
     equipos = []
 
     for imagen in sopa.find_all("img", alt=True):
-        nombre = imagen.get("alt", "").strip()
+        nombre = reparar_texto(imagen.get("alt", "").strip())
 
         if not nombre:
             continue
